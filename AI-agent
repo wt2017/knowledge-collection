@@ -33,3 +33,140 @@
 总结：
 LlamaIndex 把“企业混沌数据”变成“可随时召回的知识库”
 LangChain/LangGraph 把“召回的知识”接进“带记忆、带工具、带人工网关”的复杂决策流
+
+
+示例：
+（1） 把“召回的知识”封装成标准 Tool
+from llama_index.core.tools import QueryEngineTool
+from llama_index.core import VectorStoreIndex
+
+# 1. 任意 LlamaIndex 查询引擎
+index = VectorStoreIndex.from_documents(docs)
+engine = index.as_query_engine(similarity_top_k=10)
+
+# 2. 一键转 LangChain Tool
+knowledge_tool = QueryEngineTool.from_defaults(
+    query_engine=engine,
+    name="knowledge_base",
+    description="查询产品手册、制度、FAQ，输入自然语言问题，返回相关片段+页码。"
+).to_langchain_tool()
+
+（2） 定义“记忆池”——多轮 + 长期 + 分布式
+from langchain.memory import ConversationBufferWindowMemory
+from langchain.memory import RedisChatMessageHistory
+
+history = RedisChatMessageHistory(session_id="user_123", ttl=3600*24*7)
+memory = ConversationBufferWindowMemory(
+    k=6,                       # 最近 6 轮放入 prompt
+    chat_memory=history,
+    return_messages=True,
+    memory_key="chat_history",
+    input_key="input"
+)
+
+（3） 组装“工具箱”——知识 + 外部 API + 代码沙箱
+from langchain.agents import Tool
+from langchain_experimental.utilities import PythonREPL
+
+python_tool = Tool(
+    name="python_repl",
+    description="执行 Python 代码，用于数据分析或可视化",
+    func=PythonREPL().run
+)
+
+# 统一工具列表
+tools = [knowledge_tool, python_tool]   # 可再叠加 SQL、Zapier、Slack…
+
+（4）用 LangGraph 写“带循环、带人工节点”的决策流
+from typing import TypedDict, Annotated, Sequence
+import operator
+
+class AgentState(TypedDict):
+    input: str                     # 用户最新问题
+    chat_history: Annotated[Sequence[str], operator.add]
+    intermediate_steps: Sequence[tuple]  # (tool_name, observation) 轨迹
+    agent_outcome: str             # 最终答案
+    human_approved: bool | None    # None=待审批 True/False=结果
+
+from langchain.schema import AgentFinish
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+llm = ChatOpenAI(model="gpt-4-turbo", temperature=0)
+
+# ---- 节点 1：Agent 推理（ReAct） ----
+def agent_node(state: AgentState):
+    template = ChatPromptTemplate.from_messages([
+        ("system", "你是企业智能助手，可使用工具：{tools}。聊天历史：{chat_history}。"),
+        ("user", "{input}")
+    ])
+    agent_chain = (
+        {"tools": lambda x: [t.name for t in tools],
+         "chat_history": lambda x: state["chat_history"],
+         "input": RunnablePassthrough()}
+        | template | llm
+    )
+    # 这里简化成一次 LLM 调用，真实可用 create_react_agent
+    action = agent_chain.invoke(state["input"])
+    return {"intermediate_steps": [("agent", action.content)]}
+
+# ---- 节点 2：执行工具（可并行） ----
+def tool_node(state: AgentState):
+    # 根据 action 解析 tool_name & input
+    tool_name, tool_input = parse_action(state["intermediate_steps"][-1][1])
+    tool_output = {"knowledge_base": knowledge_tool,
+                   "python_repl": python_tool}[tool_name].invoke(tool_input)
+    return {"intermediate_steps": [(tool_name, tool_output)]}
+
+# ---- 节点 3：人工网关 ----
+def human_node(state: AgentState):
+    # 实际可调用飞书/企微审批 API
+    approve = ask_human(f"即将把以下内容返回用户，是否同意？\n{state['intermediate_steps'][-1][1]}")
+    return {"human_approved": approve}
+
+# ---- 节点 4：最终生成 ----
+def finalize_node(state: AgentState):
+    if state["human_approved"]:
+        answer = llm.invoke(f"请把以下内容整理成用户友好答案：\n{state['intermediate_steps']}")
+        return {"agent_outcome": answer.content}
+    else:
+        return {"agent_outcome": "答案涉及敏感信息，已被管理员驳回。"}
+
+（5）构图
+from langgraph.graph import StateGraph, END
+
+workflow = StateGraph(AgentState)
+
+workflow.add_node("agent", agent_node)
+workflow.add_node("tool", tool_node)
+workflow.add_node("human", human_node)
+workflow.add_node("finalize", finalize_node)
+
+workflow.set_entry_point("agent")
+workflow.add_edge("agent", "tool")
+workflow.add_edge("tool", "human")
+
+# 人工审批后分支
+workflow.add_conditional_edges(
+    "human",
+    lambda s: "finalize" if s["human_approved"] is not None else "human",
+    {"finalize": "finalize", "human": "human"}
+)
+workflow.add_edge("finalize", END)
+
+# 关键：打开 checkpointer = 支持“断点续跑”
+from langgraph.checkpoint import RedisSaver
+memory_checkpointer = RedisSaver(redis_client)
+
+app = workflow.compile(checkpointer=memory_checkpointer)
+
+（6）观测、评估
+from langchain.callbacks import LangSmithCallbackHandler
+callback = LangSmithCallbackHandler(project_name="kg_agent")
+
+# 在节点里手动埋点
+def tool_node(state: AgentState):
+    with callback.tracer().start_span("knowledge_retrieval") as span:
+        span.set_attribute("top_k", 10)
+        span.set_attribute("latency", latency)
+        ...
