@@ -52,19 +52,6 @@
 │  └────────────────────────────────────────┘
 └───────────────────────────────────────────┘
 
-工作原理：
-每个 TCK 上升沿，TMS 被采样，状态机可能转换状态
-状态转换产生控制信号（如 ShiftIR, UpdateDR）
-控制信号驱动寄存器操作：
-ShiftIR=1：每个 TCK 上升沿，IR 移位寄存器右移，TDI→MSB，LSB→TDO
-UpdateIR=1：在 Exit1-IR→Update-IR 转换时，将移位寄存器锁存到指令寄存器
-
-为什么 TAP 能在 CPU 不工作时运行？
-独立时钟：TCK 可由调试器提供，不依赖 CPU 核心时钟
-独立复位：TRST 仅复位 TAP 逻辑，不复位 CPU
-组合逻辑：状态转换是硬编码的，无需软件配置
-硅片固化：状态机逻辑在芯片设计时烧录，上电即存在
-
 [TAP 状态机]
 Test-Logic-Reset (初始状态)
     ↓ TMS=0
@@ -87,6 +74,22 @@ Update-DR      Exit2-IR ──┘
                Update-IR
                  ↓
               (返回 Run-Test/Idle)
+
+工作原理：
+状态转移发生在每个 TCK 时钟的上升沿
+根据当前状态 + TMS 值（0 或 1），决定下一个状态（如 ShiftIR, UpdateDR），公式：
+Next_State = F(Current_State, TMS@TCK_rising_edge)
+
+控制信号驱动寄存器操作：
+ShiftIR=1：每个 TCK 上升沿，IR 移位寄存器右移，TDI→MSB，LSB→TDO
+UpdateIR=1：在 Exit1-IR→Update-IR 转换时，将移位寄存器锁存到指令寄存器
+
+为什么 TAP 能在 CPU 不工作时运行？
+独立时钟：TCK 可由调试器提供，不依赖 CPU 核心时钟
+独立复位：TRST 仅复位 TAP 逻辑，不复位 CPU
+组合逻辑：状态转换是硬编码的，无需软件配置
+硅片固化：状态机逻辑在芯片设计时烧录，上电即存在
+
 
 Reset 状态：Test-Logic-Reset，TAP 逻辑复位
 Idle 状态：Run-Test/Idle，空闲等待
