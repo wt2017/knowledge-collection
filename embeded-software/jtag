@@ -58,6 +58,7 @@
 控制信号驱动寄存器操作：
 ShiftIR=1：每个 TCK 上升沿，IR 移位寄存器右移，TDI→MSB，LSB→TDO
 UpdateIR=1：在 Exit1-IR→Update-IR 转换时，将移位寄存器锁存到指令寄存器
+
 为什么 TAP 能在 CPU 不工作时运行？
 独立时钟：TCK 可由调试器提供，不依赖 CPU 核心时钟
 独立复位：TRST 仅复位 TAP 逻辑，不复位 CPU
